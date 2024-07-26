@@ -12,9 +12,22 @@ cd `dirname $0`
 
 RIG_ID_SEQUENCE_FILE=/mnt/hive-install/RIG_ID_SEQUENCE.txt
 #RIG_PASSWD_FILE=/mnt/hive-install/RIG_PASSWD.txt
-RIG_CONF_FILE=/mnt/hive-install/hive-config.stub/rig-config-example.txt
+RIG_CONF_FILE=/mnt/hive-install/rig.conf
 FLASHER_CONFIG_FILE=/mnt/hive-install/flasher-config.txt
 ETH0_CONFIG_FILE=/mnt/hive-install/hive-config.stub/network/20-ethernet.network
+
+TIMEOUT=20
+DOWNLOAD_URL=https://download.hiveos.farm
+DOWNLOAD2_URL=https://download2.hiveos.farm
+
+# image file mask
+IMG_EXT="(zip|xz|gz)"
+OS_REGEX="[^\"]+\.$IMG_EXT"
+URL_MASK="^https://.+/${OS_REGEX}$"
+ARCHIVE_REGEX="(\"|^)\K${OS_REGEX}(?=(\"|$))"
+
+
+HIVE_HOST_URL="https://api.hiveos.farm"
 
 flasher_config=`cat $FLASHER_CONFIG_FILE | dos2unix`
 eval "$flasher_config"
@@ -27,34 +40,90 @@ echo
 
 echo -e "${YELLOW}
 ===================================
-====== Flashing Utility v0.3 ======
+====== Flashing Utility v0.4 ======
 ===================================
 ${NOCOLOR}
 "
 
 sleep 1
+comp=
+build_variant=stable
+autoinstall=
 
+for x in $(cat /proc/cmdline); do
+	case $x in
+	build_variant=*)
+		build_variant=${x#build_variant=}
+		;;
+	autoinstall)
+		autoinstall=1
+		;;
+	FARM_HASH=*)
+		FARM_HASH=${x#FARM_HASH=}
+		;;
+	esac
+done
 
-function install () {
+function url_decode() {
+    echo -e "${1//%/\\x}"
+}
+
+function check_archive {
+    echo -e "\n${CYAN}> Checking archive integrity${NOCOLOR}"
+    xz -t --verbose $1 > /dev/null
+    [[ $? -ne 0 ]] && echo -e "${RED}Archive is damaged${NOCOLOR}" && return 1
+    echo -e "${GREEN}OS image ready!${NOCOLOR}"
+    return 0
+}
+
+function get_image_from_url {
+    local from_url=
+    responce=`curl --silent --head "$DOWNLOAD_URL" | awk '/^HTTP/{print $2}'`
+    if [[ $responce -eq 200 ]]; then
+	echo -e "Use primary download server."
+	from_url=$( url_decode "$DOWNLOAD_URL/$build_variant/" )
+    else
+	echo -e "Use secondary download server."
+	from_url=$( url_decode "$DOWNLOAD2_URL/$build_variant/" )
+    fi
+    
+    url=`curl --connect-timeout $TIMEOUT --retry 2 -fskL --head -w '%{url_effective}' "$from_url" 2>/dev/null | tail -n 1`
+    if [[ $? -eq 0 && "$url" =~ $URL_MASK ]]; then
+	imgfile=`basename $url`
+	archsize=`curl -s --head "$url" | grep -ioP "content-length:[^0-9]+\K[0-9]+" | awk '{print int($1/1000000)}'`
+	echo -e "\n${CYAN}> Downloading $build_variant image file ($archsize)MiB${NOCOLOR}"
+	wget -t 0 -T $TIMEOUT --no-check-certificate -q --show-progress -P /mnt/hive-install/ "$url"
+	[[ $? -eq 0 ]] && check_archive /mnt/hive-install/$imgfile
+	return $?
+    else
+	echo -e "$RED> Got bad url for $build_variant image - $url${NOCOLOR}"
+	return 1
+    fi
+    echo -e "$RED> Unable to get url for $build_variant image${NOCOLOR}"
+    return 2
+}
+
+function check_image {
 
     #imgfile=hive-0.5-45-20180418.img
     #imgfile=`realpath hive.img`
 
-
     imgfile=`find /mnt/hive-install -name "*@*.img" | head -n 1`
+    xzfile=`find /mnt/hive-install -name "*@*.img.xz" | head -n 1`
+    [[ ! -z $xzfile ]] && imgfile=$xzfile
+    [[ ! -z $xzfile ]] && comp=xz
 
-    [[ -z $imgfile ]] &&
-        echo -e "${RED}Image not found, place it on disk please${NOCOLOR}" &&
-        return 1
+    if [[ -z $imgfile ]]; then
+        echo -e "${RED}Image not found, try to downlooad...${NOCOLOR}"
+        get_image_from_url
+	imgfile=`find /mnt/hive-install -name "*@*.img.xz" | head -n 1`
+	comp=xz
+    else
+        echo -e "Found image: ${GREEN}`basename $imgfile`${NOCOLOR}";
+    fi
+}
 
-    [[ ! -e $imgfile ]] &&
-        echo -e "${RED}$imgfile does not exist${NOCOLOR}" &&
-        return 1
-
-
-    echo -e "Found image: ${GREEN}`basename $imgfile`${NOCOLOR}";
-
-
+function find_disk {
 
     bootpart=`readlink -f /dev/block/$(mountpoint -d /)`
     [[ "$bootpart" =~ nvme ]] && bootdisk=${bootpart::-2} || bootdisk=${bootpart::-1}
@@ -62,182 +131,190 @@ function install () {
 
 
     #Disk /dev/sdb: 111.8 GiB, 120034123776 bytes, 234441648 sectors
-    otherdisk=`fdisk -l | grep 'Disk /dev/' | grep -v "$bootdisk" | head -n1 | awk '{print $2}'`
+    otherdisk=`fdisk -l | grep 'Disk /dev/' | grep -v "$bootdisk" | grep -v "/dev/loop" | head -n1 | awk '{print $2}'`
     [[ -z $otherdisk ]] &&
         echo -e "${RED}No other disk found${NOCOLOR}" &&
-        return 1
+        return 4
 
-    [[ "$otherdisk" =~ nvme ]] && otherdisk=${otherdisk::-2} || otherdisk=${otherdisk::-1}
+    [[ "$otherdisk" =~ nvme ]] && otherdisk=${otherdisk::-1} || otherdisk=${otherdisk::-1}
 
     [[ -z $otherdisk ]] &&
         fdisk -l | grep 'Disk /dev/' &&
         echo -e "${RED}Unable to detect other disk${NOCOLOR}" &&
-        return 1
+        return 4
 
     echo ""
     echo -e "Detected other disk ${BPURPLE}$otherdisk${NOCOLOR}"
-    echo -en ${YELLOW}
-	parted -ml | grep -m1 "$otherdisk:" | awk -F ':' '{print $7 " " $2}'
-    echo -en ${NOCOLOR}
-    fdisk -l | grep "Disk $otherdisk:"
-
-
-    read -n 1 -p "Press ESCAPE to ABORT or wait 10 seconds or ENTER to continue " -t 10 input
-    [[ $input == $'\e' ]] &&
-        echo -e "\nEscape pressed, aborting" &&
-        return 0
-
-
+    #echo -en ${YELLOW}
+	#parted -ml | grep -m1 "$otherdisk:" | awk -F ':' '{print $7 " " $2}'
+    #echo -en ${NOCOLOR}
+    #fdisk -l | grep "Disk $otherdisk:"
+    return 0
+}
+function preconfig {
 
     echo
 
 
     #Get preconfigured api host
+    if [[  -z $FARM_HASH ]]; then
+	echo -e "${RED}$FARM_HASH is not set ${NOCOLOR}"
+    else
+	echo -e "FARM_HASH=$FARM_HASH"
+    fi
+
     if [[ ! -e $RIG_CONF_FILE ]]; then
-        echo -e "${RED}$RIG_CONF_FILE does not exist${NOCOLOR}" &&
-        return 1
+        echo -e "${RED}$RIG_CONF_FILE does not exist ${NOCOLOR}"
+	noconf=1
+        #return 1
         #eval `cat $RIG_CONF_FILE | dos2unix | grep '^HIVE_HOST_URL='`
         #eval `cat $RIG_CONF_FILE | dos2unix | grep '^RIG_PASSWD='`
         #eval `cat $RIG_CONF_FILE | dos2unix | grep '^X_DISABLED='`
-    fi
+    else
     rig_conf=`cat $RIG_CONF_FILE | dos2unix`
     eval "$rig_conf"
     #[[ -z $HIVE_HOST_URL ]] && HIVE_HOST_URL='https://api.hiveos.farm'
 
-    RIG_ID=$(cat $RIG_ID_SEQUENCE_FILE | head -n 1 | dos2unix)
-    [[ $RIG_ID == 0 ]] && RIG_ID=
-
-
-
-    [[ -z $FARM_HASH && -z $RIG_ID ]] &&
-        echo -e "${RED}You need to set FARM_HASH in $RIG_CONF_FILE or RIG_ID sequence in $RIG_ID_SEQUENCE_FILE${NOCOLOR}" &&
-        return 1
-
-
-	[[ -z $FARM_HASH && ! -z $RIG_ID ]] &&
-		RIG_ID= &&
-        echo -e "${YELLOW}FARM_HASH is set, RIG_ID is ignored${NOCOLOR}"
-
-
-
-	# Network config --------------------------------------------------------------
-
-    echo -e "Default Network configuration will be written"
-    read -n 1 -p "Press ESCAPE to EDIT net config or wait 10 seconds or ENTER to continue " -t 10 input
-    if [[ $input == $'\e' ]]; then
-        mc -e $ETH0_CONFIG_FILE
-        sync
-        echo -e "Network configuration was edited, will continue in 2 seconds"
-        sleep 2
+    #RIG_ID=$(cat $RIG_ID_SEQUENCE_FILE | head -n 1 | dos2unix)
+    #[[ $RIG_ID == 0 ]] && RIG_ID=
     fi
-    echo
-
-	if [[ $APPEND_STATIC_IP_TO_NAME == 1 && ! -z $WORKER_NAME ]]; then
-		Address=
-        eval `cat $ETH0_CONFIG_FILE | dos2unix | grep '^Address='`
-		if [[ ! -z $Address ]]; then #Address=192.168.0.189/24
-			Address=`echo $Address | awk -F'/' '{print $1}'`
-			WORKER_NAME+="-$Address"
-			rig_conf=$(sed "s/^WORKER_NAME=.*\$/WORKER_NAME=$WORKER_NAME/g" <<< "$rig_conf")
-#			echo -e "WORKER_NAME:   ${BGREEN}$WORKER_NAME${NOCOLOR}"
-#	        sleep 2
-		fi
-	fi
-
-
-
-
-    echo
-
-	# Show values --------------------------------------------------------------
+    [[ -z $HIVE_HOST_URL ]] && HIVE_HOST_URL="https://api.hiveos.farm"
 
 
     [[ ! -z $FARM_HASH ]] &&
-    	echo -e "FARM_HASH:     ${CYAN}$FARM_HASH${NOCOLOR}"
+	RIG_ID= &&
+        echo -e "${YELLOW}FARM_HASH is set, RIG_ID is ignored${NOCOLOR}"
+	if [[ $noconf -eq 1 ]]; then
+	    rig_conf="FARM_HASH=$FARM_HASH" <<< "$rig_conf"
+	    rig_conf+="\nHIVE_HOST_URL=$HIVE_HOST_URL" <<< "$rig_conf"
+	fi
+    if [[ -z $FARM_HASH && -z $RIG_ID ]]; then
+        echo -e "${RED}You need to set FARM_HASH or RIG_ID ${NOCOLOR}" 
+	read -n 1 -p "Press ESCAPE to set RIG_ID or wait 10 seconds or ENTER to continue " -t 10 input
+	if [[ $input == $'\e' ]]; then
+	    [[ ! -z $FARM_HASH ]] && return 4
+	    echo
+	    while true; do
+		read -p "Enter new RIG_ID: " RIG_ID
+		typeset -i RIG_ID="$RIG_ID"
+		if [[ $RIG_ID -gt 0 ]]; then
+		    echo -e "New RIG_ID=${GREEN}$RIG_ID${NOCOLOR}"
+		    sleep 2
+		    break
+		fi
+	    done
+
+	    while true; do
+		read -p "Enter new RIG_PASSWD: " RIG_PASSWD
+		typeset -i RIG_PASSWD="$RIG_PASSWD"
+		if [[ $RIG_ID -gt 0 ]]; then
+		    echo -e "New RIG_PASSWD=${GREEN}$RIG_PASSWD${NOCOLOR}"
+		    sleep 2
+		    break
+		fi
+	    done
+
+	fi
+	echo
+    fi
+
+
+
+    echo
+
+    # Show values --------------------------------------------------------------
+
+
+    [[ ! -z $HIVE_HOST_URL ]] &&
+	echo -e "HIVE_HOST_URL:     ${CYAN}$HIVE_HOST_URL${NOCOLOR}"
+
+    [[ ! -z $FARM_HASH ]] &&
+	echo -e "FARM_HASH:     ${CYAN}$FARM_HASH${NOCOLOR}"
 
     [[ ! -z $RIG_ID ]] &&
-	    echo -e "RIG_ID:        ${BGREEN}$RIG_ID${NOCOLOR}"
+        echo -e "RIG_ID:        ${BGREEN}$RIG_ID${NOCOLOR}"
 
     [[ ! -z $RIG_PASSWD ]] &&
-    	echo -e "RIG_PASSWD:    ${NOCOLOR}$RIG_PASSWD${NOCOLOR}"
+	echo -e "RIG_PASSWD:    ${NOCOLOR}$RIG_PASSWD${NOCOLOR}"
 
 
+    if [[ $noconf -eq 1 ]]; then
+    #save rig_id to config
+    [[ ! -z $RIG_ID  ]] &&
+        rig_conf+="\nRIG_ID=$RIG_ID"
 
-	if [[ ! -z $RIG_ID ]]; then
-		read -n 1 -p "Press ESCAPE to change RIG_ID or wait 10 seconds or ENTER to continue " -t 10 input
-		if [[ $input == $'\e' ]]; then
-			[[ ! -z $FARM_HASH ]] && return 1
-			echo
-			while true; do
-				read -p "Enter new RIG_ID: " RIG_ID
-				typeset -i RIG_ID="$RIG_ID"
-				if [[ $RIG_ID -gt 0 ]]; then
-					echo -e "New RIG_ID=${GREEN}$RIG_ID${NOCOLOR}"
-					FARM_HASH=
-					rig_conf=$(sed "s/^FARM_HASH=.*\$/FARM_HASH=/g" <<< "$rig_conf")
-					sleep 2
-					break
-				fi
-			done
-		fi
-		echo
-	fi
-
-	#save rig_id to config
-    [[ ! -z $RIG_ID ]] &&
+    #save rig_passwd to config
+    [[ ! -z $RIG_PASSWD ]] &&
+        rig_conf+="\nRIG_PASSWD=$RIG_PASSWD"
+    else
+    #save rig_id to config
+    [[ ! -z $RIG_ID  ]] &&
         rig_conf=$(sed "s/^RIG_ID=.*\$/RIG_ID=$RIG_ID/g" <<< "$rig_conf")
 
+    #save rig_passwd to config
+    [[ ! -z $RIG_PASSWD ]] &&
+        rig_conf=$(sed "s/^RIG_PASSWD=.*\$/RIG_PASSWD=$RIG_PASSWD/g" <<< "$rig_conf")
+    fi
 
 
-	# Change worker name --------------------------------------------------------------
+    # Change worker name --------------------------------------------------------------
 
-	if [[ ! -z $FARM_HASH ]]; then
-		[[ ! -z $WORKER_NAME ]] &&
-			echo -e "WORKER_NAME:   ${GREEN}$WORKER_NAME${NOCOLOR}" ||
-			echo -e "WORKER_NAME:   ${YELLOW}<web generated>${NOCOLOR}"
+    if [[ ! -z $FARM_HASH ]]; then
+	[[ ! -z $WORKER_NAME ]] &&
+	    echo -e "WORKER_NAME:   ${GREEN}$WORKER_NAME${NOCOLOR}" ||
+	    echo -e "WORKER_NAME:   ${YELLOW}<web generated>${NOCOLOR}"
 
-		read -n 1 -p "Press ESCAPE to change WORKER_NAME or wait 10 seconds or ENTER to continue " -t 10 input
-		if [[ $input == $'\e' ]]; then
-			echo
-			while true; do
-				read -p "Enter new WORKER_NAME: " WORKER_NAME
-				if [[ ! -z $WORKER_NAME ]]; then
-					echo -e "New WORKER_NAME: ${GREEN}$WORKER_NAME${NOCOLOR}"
-					rig_conf=$(sed "s/^WORKER_NAME=.*\$/WORKER_NAME=$WORKER_NAME/g" <<< "$rig_conf")
-					sleep 2
-					break
-				fi
-			done
+	read -n 1 -p "Press ESCAPE to change WORKER_NAME or wait 10 seconds or ENTER to continue " -t 10 input
+	if [[ $input == $'\e' ]]; then
+	    echo
+	    while true; do
+		read -p "Enter new WORKER_NAME: " WORKER_NAME
+		if [[ ! -z $WORKER_NAME ]]; then
+		    echo -e "New WORKER_NAME: ${GREEN}$WORKER_NAME${NOCOLOR}"
+		    if [[ $noconf -eq 1 ]]; then
+			rig_conf+="\nWORKER_NAME=$WORKER_NAME"
+		    else
+			rig_conf=$(sed "s/^WORKER_NAME=.*\$/WORKER_NAME=$WORKER_NAME/g" <<< "$rig_conf")
 		fi
-		echo
+		    sleep 2
+		    break
+		fi
+	    done
 	fi
-
-
-
-	# Show values --------------------------------------------------------------
 	echo
+    fi
+
+
+
+    # Show values --------------------------------------------------------------
+    echo
 
     echo -e "${YELLOW}rig.conf:${NOCOLOR}"
-    echo "$rig_conf" | grep -v '^#' | grep -v "^[[:space:]]*$"
+    echo -e "$rig_conf" | grep -v '^#' | grep -v "^[[:space:]]*$"
 
-	echo
+    echo
+
+}
+
+function write_image {
+    # GO GO GO ! --------------------------------------------------------------
 
     read -n 1 -p "Press ESCAPE to ABORT or wait 10 seconds or ENTER to continue " -t 10 input
     [[ $input == $'\e' ]] &&
         echo -e "\nEscape pressed, aborting" &&
-        return 0
+        return 1
 
-
-
-	# GO GO GO ! --------------------------------------------------------------
-
-	echo
-	echo --------------------------------------------------------------
+    echo
+    echo --------------------------------------------------------------
     echo
 
     #otherdisk=/dev/null #for testing
     echo -e "${YELLOW}Writing image to $otherdisk${NOCOLOR}"
-    ddcmd="dd if=$imgfile of=$otherdisk bs=10M status=progress"
+    if [[ ! -z $comp ]]; then
+	ddcmd="xz -d -c $imgfile | dd of=$otherdisk bs=1M status=progress"
+    else
+	ddcmd="dd if=$imgfile of=$otherdisk bs=1M status=progress"
+    fi
     echo -e "${CYAN}$ddcmd${NOCOLOR}"
     eval "$ddcmd"
     [[ $? -ne 0 ]] && echo -e "${RED}Error writing image${NOCOLOR}" && return 1
@@ -247,61 +324,67 @@ function install () {
     sgdisk -C $otherdisk > /dev/null 2>&1
     partprobe $otherdisk > /dev/null 2>&1
     sleep 5
+    return 0
+}
 
-
-	# Writing files to new partition --------------------------------------------------------------
+function write_config {
+    # Writing files to new partition --------------------------------------------------------------
 
     echo
 
     [[ "$otherdisk" =~ nvme ]] && otherdisk=${otherdisk}p1 || otherdisk=${otherdisk}1
     echo -e "${YELLOW}Writing configuration to $otherdisk${NOCOLOR}"
-    mount -t ntfs-3g ${otherdisk} /mnt/hive-config
+    mkdir -p /hive-config
+    ntfsfix ${otherdisk}
+    mount ${otherdisk} /hive-config
     [[ $? -ne 0 ]] && echo -e "${RED}Unable to mount ${otherdisk}${NOCOLOR}" && return 1
 
     # Update config partition with predefined configs
-    [[ -d /mnt/hive-install/hive-config.stub ]] &&
-        cp -rf /mnt/hive-install/hive-config.stub/* /mnt/hive-config/
+    #[[ -d /mnt/hive-install/hive-config.stub ]] &&
+    #    cp -rf /mnt/hive-install/hive-config.stub/* /mnt/hive-config/
 
 
-    echo "$rig_conf" > /mnt/hive-config/rig.conf
+    echo -e "$rig_conf" > /hive-config/rig.conf
     sync
 
     #Save number
-    if [[ ! -z $RIG_ID ]]; then
-        RIG_ID=$((RIG_ID+1))
-        echo -n $RIG_ID > $RIG_ID_SEQUENCE_FILE
-        sync
-    fi
+    #if [[ ! -z $RIG_ID ]]; then
+    #    RIG_ID=$((RIG_ID+1))
+    #    echo -n $RIG_ID > $RIG_ID_SEQUENCE_FILE
+    #    sync
+    #fi
 
 
 
 
-    umount /mnt/hive-config
+    #umount /hive-config
+    umount ${otherdisk}
 
+}
 
-	# Final actions --------------------------------------------------------------
+function shutdown_power {
+    # Final actions --------------------------------------------------------------
 
 
     echo
     echo -e "${GREEN}Done. You can shutdown.${NOCOLOR}"
-    if [[ $SHUTDOWN_AFTER_FLASHING == 1 ]]; then
-	    read -n 1 -p "Will shutdown in 10 seconds. Press ESCAPE to abort or ENTER to do it right now. " -t 10 input
-    	if [[ $input == $'\e' ]]; then
-    		return 0
-    	fi
-		shutdown now
+    if [[ $SHUTDOWN_AFTER_FLASHING == 1 || $? -eq 4 ]]; then
+        read -n 1 -p "Will shutdown in 10 seconds. Press ESCAPE to abort or ENTER to do it right now. " -t 10 input
+	if [[ $input == $'\e' ]]; then
+	    return 0
+	fi
+	shutdown now
    fi
 }
-
-
-
 
 function shell() {
     bash --login
 }
 
-
-
-install
-
+find_disk
+[[ $? -eq 0 ]] && check_image
+[[ $? -eq 0 ]] && preconfig
+[[ $? -eq 0 ]] && write_image
+[[ $? -eq 0 ]] && write_config
+shutdown_power
 shell
